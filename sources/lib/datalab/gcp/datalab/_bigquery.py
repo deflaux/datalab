@@ -61,7 +61,7 @@ def _create_dry_run_subparser(parser):
   dry_run_parser = parser.subcommand('dryrun',
       'Execute a dry run of a BigQuery query and display approximate usage statistics')
   dry_run_parser.add_argument('-q', '--query',
-                             help='The name of the query to be dry run')
+                              help='The name of the query to be dry run')
   dry_run_parser.add_argument('-v', '--verbose',
                               help='Show the expanded SQL that is being executed',
                               action='store_true')
@@ -78,9 +78,8 @@ def _create_execute_subparser(parser):
                               choices=['create', 'append', 'overwrite'])
   execute_parser.add_argument('-l', '--large', help='Whether to allow large results',
                               action='store_true')
-  execute_parser.add_argument('-q', '--query', help='The name of query to run',
-                              nargs='?')
-  execute_parser.add_argument('-t', '--target', help='target table name', nargs='?')
+  execute_parser.add_argument('-q', '--query', help='The name of query to run')
+  execute_parser.add_argument('-t', '--target', help='target table name')
   execute_parser.add_argument('-v', '--verbose',
                               help='Show the expanded SQL that is being executed',
                               action='store_true')
@@ -184,32 +183,40 @@ def _create_load_subparser(parser):
   return load_parser
 
 
-def _get_query_argument(args, config, env):
+def _get_query_argument(args, cell, env):
   """ Get a query argument to a cell magic.
 
   The query is specified with args['query']. We look that up and if it is a BQ query
   just return it. If it is instead a SqlModule or SqlStatement it may have variable
   references. We resolve those using the arg parser for the SqlModule, then override
-  the resulting defaults with either the Python code in config, or the dictionary in
+  the resulting defaults with either the Python code in cell, or the dictionary in
   overrides. The latter is for if the overrides are specified with YAML or JSON and
   eventually we should eliminate code in favor of this.
 
   Args:
     args: the dictionary of magic arguments.
-    config: the cell contents which can be variable value overrides.
+    cell: the cell contents which can be variable value overrides (if args has a 'query'
+        value) or inline SQL otherwise.
     env: a dictionary that is used for looking up variable values.
   Returns:
     A Query object.
   """
-  sql_arg = args['query']
+  sql_arg = args.get('query', None)
+  if sql_arg is None:
+    # Assume we have inline SQL in the cell
+    if not isinstance(cell, basestring):
+      raise Exception('Expected a --query argument or inline SQL')
+    return gcp.bigquery.Query(cell, values=env)
+
   item = _get_notebook_item(sql_arg)
   if isinstance(item, gcp.bigquery.Query):  # Queries are already expanded.
     return item
 
   # Create an expanded BQ Query.
+  env = _utils.parse_config(cell, env)
   item, env = gcp.data.SqlModule.get_sql_statement_with_environment(item, env)
-  if config:
-    env.update(config)
+  if cell:
+    env.update(cell)
   return gcp.bigquery.Query(item, values=env)
 
 
@@ -224,18 +231,17 @@ def _sample_cell(args, cell_body):
     was specified. None otherwise.
   """
 
-  env = _notebook_environment()
+  env = _utils.notebook_environment()
   query = None
   table = None
   view = None
 
   if args['query']:
-    config = _utils.parse_config(cell_body, env)
-    query = _get_query_argument(args, config, env)
+    query = _get_query_argument(args, cell_body, env)
   elif args['table']:
     table = _get_table(args['table'])
   elif args['view']:
-    view = _get_notebook_item(args['view'])
+    view = _utils.get_notebook_item(args['view'])
     if not isinstance(view, gcp.bigquery.View):
       raise Exception('%s is not a view' % args['view'])
   else:
@@ -270,22 +276,20 @@ def _sample_cell(args, cell_body):
   return results
 
 
-def _dryrun_cell(args, config):
+def _dryrun_cell(args, cell_body):
   """Implements the BigQuery cell magic used to dry run BQ queries.
 
    The supported syntax is:
-   %%bigquery dryrun -q|--sql <query identifier>
-   <config>
+   %%bigquery dryrun [-q|--sql <query identifier>]
+   [<YAML or JSON cell_body or inline SQL>]
 
   Args:
     args: the argument following '%bigquery dryrun'.
-    config: optional contents of the cell interpreted as YAML or JSON.
+    cell_body: optional contents of the cell interpreted as YAML or JSON.
   Returns:
     The response wrapped in a DryRunStats object
   """
-  env = _notebook_environment()
-  config = _utils.parse_config(config, env)
-  query = _get_query_argument(args, config, env)
+  query = _get_query_argument(args, cell_body, _utils.notebook_environment())
 
   if args['verbose']:
     print query.sql
@@ -359,41 +363,39 @@ def _udf_cell(args, js):
 
   # Finally build the UDF object
   udf = gcp.bigquery.UDF(inputs, outputs, variable_name, js, support_code, imports)
-  _notebook_environment()[variable_name] = udf
+  _utils.notebook_environment()[variable_name] = udf
 
 
-def _execute_cell(args, config):
+def _execute_cell(args, cell_body):
   """Implements the BigQuery cell magic used to execute BQ queries.
 
    The supported syntax is:
-   %%bigquery execute -q|--sql <query identifier> <other args>
-   <config>
+   %%bigquery execute [-q|--sql <query identifier>] <other args>
+   [<YAML or JSON cell_body or inline SQL>]
 
   Args:
     args: the arguments following '%bigquery execute'.
-    config: optional contents of the cell interpreted as YAML or JSON.
+    cell_body: optional contents of the cell interpreted as YAML or JSON.
   Returns:
     The QueryResultsTable
   """
-  env = _notebook_environment()
-  config = _utils.parse_config(config, env)
-  query = _get_query_argument(args, config, env)
+  query = _get_query_argument(args, cell_body, _utils.notebook_environment())
   if args['verbose']:
     print query.sql
   return query.execute(args['target'], table_mode=args['mode'], use_cache=not args['nocache'],
                        allow_large_results=args['large']).results
 
 
-def _pipeline_cell(args, config):
+def _pipeline_cell(args, cell_body):
   """Implements the BigQuery cell magic used to validate, execute or deploy BQ pipelines.
 
    The supported syntax is:
-   %%bigquery pipeline -q|--sql <query identifier> <other args> <action>
-   <config>
+   %%bigquery pipeline [-q|--sql <query identifier>] <other args> <action>
+   [<YAML or JSON cell_body or inline SQL>]
 
   Args:
     args: the arguments following '%bigquery pipeline'.
-    config: optional contents of the cell interpreted as YAML or JSON.
+    cell_body: optional contents of the cell interpreted as YAML or JSON.
   Returns:
     The QueryResultsTable
   """
@@ -401,12 +403,11 @@ def _pipeline_cell(args, config):
     raise Exception('Deploying a pipeline is not yet supported')
 
   env = {}
-  for key, value in _notebook_environment().iteritems():
+  for key, value in _utils.notebook_environment().iteritems():
     if isinstance(value, gcp.bigquery._udf.FunctionCall):
       env[key] = value
 
-  config = _utils.parse_config(config, env)
-  query = _get_query_argument(args, config, env)
+  query = _get_query_argument(args, cell_body, env)
   if args['verbose']:
     print query.sql
   if args['action'] == 'dryrun':
@@ -439,24 +440,14 @@ def _table_line(args):
     html = _table_viewer(table, rows_per_page=args['rows'], fields=fields)
     return IPython.core.display.HTML(html)
   else:
-    raise Exception('%s does not exist' % name)
+    raise Exception('Table %s does not exist; cannot display' % name)
 
 
-def _notebook_environment():
-  """ Get the IPython user namespace. """
-  ipy = IPython.get_ipython()
-  return ipy.user_ns
-
-
-def _get_notebook_item(name):
-  """ Get an item from the IPython environment. """
-  env = _notebook_environment()
-  return gcp._util.get_item(env, name)
 
 
 def _get_schema(name):
   """ Given a variable or table name, get the Schema if it exists. """
-  item = _get_notebook_item(name)
+  item = _utils.get_notebook_item(name)
   if not item:
     item = _get_table(name)
 
@@ -481,7 +472,7 @@ def _get_table(name):
     The Table, if found.
   """
   # If name is a variable referencing a table, use that.
-  item = _get_notebook_item(name)
+  item = _utils.get_notebook_item(name)
   if isinstance(item, gcp.bigquery.Table):
     return item
   # Else treat this as a BQ table name and return the (cached) table if it exists.
@@ -506,14 +497,14 @@ def _schema_line(args):
   # TODO(gram): surely we could just return the schema itself?
   name = args['table'] if args['table'] else args['view']
   if name is None:
-    raise Exception('No table or view specified')
+    raise Exception('No table or view specified; cannot show schema')
 
   schema = _get_schema(name)
   if schema:
     html = _repr_html_table_schema(schema)
     return IPython.core.display.HTML(html)
   else:
-    raise Exception('%s does not exist' % name)
+    raise Exception('%s is not a schema and does not appear to have a schema member' % name)
 
 
 def _render_table(data, fields=None):
@@ -569,7 +560,7 @@ def _tables_line(args):
 
 
 def _extract_line(args):
-  """Implements the BigQuery extract magic used to display tables in a dataset.
+  """Implements the BigQuery extract magic used to extract table data to GCS.
 
    The supported syntax is:
 
@@ -581,14 +572,14 @@ def _extract_line(args):
     A message about whether the extract succeeded or failed.
   """
   name = args['source']
-  source = _get_notebook_item(name)
+  source = _utils.get_notebook_item(name)
   if not source:
     source = _get_table(name)
 
   if not source:
-    raise Exception('No such source: %s' % name)
+    raise Exception('No source named %s found' % name)
   elif isinstance(source, gcp.bigquery.Table) and not source.exists():
-    raise Exception('Source %s does not exist' % name)
+    raise Exception('Table %s does not exist' % name)
   else:
 
     job = source.extract(args['destination'],
@@ -728,7 +719,7 @@ def bigquery(line, cell=None):
   namespace = {}
   if line.find('$') >= 0:
     # We likely have variables to expand; get the appropriate context.
-    namespace = _notebook_environment()
+    namespace = _utils.notebook_environment()
 
   return _utils.handle_magic_line(line, cell, _bigquery_parser, namespace=namespace)
 
@@ -775,9 +766,9 @@ def _table_viewer(table, rows_per_page=25, fields=None):
     A string containing the HTML for the table viewer.
   """
   if not table.exists():
-    raise Exception('%s does not exist' % str(table))
+    raise Exception('Table %s does not exist' % str(table))
 
-  _HTML_TEMPLATE = """
+  _HTML_TEMPLATE = u"""
     <div class="bqtv" id="{div_id}">{static_table}</div>
     <br />{meta_data}<br />
     <script>

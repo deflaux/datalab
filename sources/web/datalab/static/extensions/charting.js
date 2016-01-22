@@ -108,8 +108,8 @@ define("extensions/charting", function () {
     }
     model.firstRow = startRow;
     var dt = new model.visualization.DataTable({
-      'cols': model.data.cols,
-      'rows': model.data.rows.slice(startRow - model.dataOffset,
+      cols: model.data.cols,
+      rows: model.data.rows.slice(startRow - model.dataOffset,
           startRow - model.dataOffset + count)
     });
     model.chart.draw(dt, model.options);
@@ -138,8 +138,100 @@ define("extensions/charting", function () {
     if (count == 0) {
       return true;
     }
-    return startRow >= model.dataOffset &&
+    return model.data && startRow >= model.dataOffset &&
         (startRow + count) <= (model.dataOffset + model.data.rows.length);
+  }
+
+  // Iterate through any widget controls and build up a YAML representation
+  // of their values that can be passed to the Python kernel as part of the
+  // magic to fetch data (also used as part of the cache key).
+  function getControlEnvironment(model) {
+      var env = '';
+      if (model.controlIds) {
+        for (var i = 0; i < model.controlIds.length; i++) {
+          var id = model.controlIds[i];
+          var e = document.getElementById(id);
+          var parts = id.split('__');
+          var varname = parts[1];
+          var splitPoint = varname.indexOf(':');
+          if (splitPoint >= 0) { // this is a checkbox group
+            var count = parseInt(varname.substring(splitPoint + 1));
+            varname = varname.substring(0, splitPoint);
+            var cbBaseId = parts[0] + '__' + varname + ':';
+            env += varname + ': [';
+            var sep = '';
+            for (var j = 0; j < count; j++) {
+              var cb = document.getElementById(cbBaseId + j);
+              if (cb.checked) {
+                env += sep + cb.value;
+                sep = ',';
+              }
+            }
+            env += ']\n';
+          } else if (e && e.type == 'checkbox') {
+            // boolean
+            env += varname + ': ' + (e.checked ? 'on' : 'off') + '\n';
+          } else {
+            // picker/slider/text
+            env += varname + ': ' + e.value + '\n';
+          }
+        }
+      }
+      return env;
+  }
+
+  function update(model, newData, first, fetchCount, startRow) {
+    convertDates(newData.data);
+    model.data = newData.data;
+    if (model.chartStyle != 'paged_table') {
+      model.chart.draw(new model.visualization.DataTable(model.data), model.options);
+    }
+    else {
+      model.dataOffset = first;
+      // If we didn't know the data length before we do now if we got less than we asked for.
+      if (model.totalRows < 0) {
+        var len = model.data.rows.length;
+        if (len != fetchCount) {
+          model.totalRows = first + len;
+        }
+      }
+      // Calculate the number of rows we want to display.
+      var pageCount = getPageRowCount(model, startRow);
+      chartPage(model, startRow, pageCount);
+    }
+  }
+
+  function refresh(model, first, fetchCount, startRow) {
+    var env = getControlEnvironment(model);
+    var key = env + first + '/' + fetchCount;
+    if (model.cache[key]) {
+      update(model, model.cache[key], first, fetchCount, startRow);
+      return;
+    }
+    var code = model.fetchCode + ' ' + first + ' ' + fetchCount + '\n' + env;
+
+    // TODO: hook into the notebook UI to enable/disable 'Running...' while we
+    // fetch more data.
+    if (!model.cellElement) {
+      var cell = getCell(model);
+      if (cell) {
+        model.cellElement = cell.element;
+      }
+    }
+    if (model.cellElement) {
+      model.cellElement.removeClass('completed');
+    }
+    datalab.session.execute(code, function (error, newData) {
+      if (model.cellElement) {
+        model.cellElement.addClass('completed');
+      }
+      if (error) {
+        onError(model.visualization, model.dom, error);
+      } else {
+        model.cache[key] = newData;
+        update(model, newData, first, fetchCount, startRow);
+      }
+    });
   }
 
   // Function to get a range of data and update chart with one page of data.
@@ -165,25 +257,7 @@ define("extensions/charting", function () {
         last = model.totalRows - 1;
       }
       var fetchCount = last - first + 1;
-      var code = model.fetchCode + ' ' + first + ' ' + fetchCount;
-
-      datalab.session.execute(code, function (error, newData) {
-        if (error) {
-          onError(model.visualization, model.dom, error);
-        } else {
-          convertDates(newData.data);
-          model.data = newData.data;
-          model.dataOffset = first;
-          // If we didn't know the data length before we do now if we got less than we asked for.
-          if (model.totalRows < 0) {
-            var len = model.data.rows.length;
-            if (len != fetchCount) {
-              model.totalRows = first + len;
-            }
-          }
-          chartPage(model, startRow, pageCount);
-        }
-      });
+      refresh(model, first, fetchCount, startRow);
     }
   }
 
@@ -196,17 +270,107 @@ define("extensions/charting", function () {
     }
   }
 
+  function getCell(model) {
+    if (!model.hasIPython) {
+      return undefined;
+    }
+    var cells = IPython.notebook.get_cells();
+    for (var cellindex in cells) {
+      var cell = cells[cellindex];
+      if (cell.element && cell.element.length) {
+        var element = cell.element[0];
+        var chartDivs = element.getElementsByClassName('bqgc');
+        if (chartDivs && chartDivs.length && chartDivs[0].id == model.dom.id) {
+          return cell;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  function removeStaticChart(model) {
+    var cell = getCell(model);
+    if (cell) {
+      var pngDivs = cell.element[0].getElementsByClassName('output_png');
+      if (pngDivs) {
+        for (var i = 0; i < pngDivs.length; i++) {
+          pngDivs[i].innerHTML = '';
+        }
+      }
+      var cell_outputs = cell.output_area.outputs;
+      for (var outputindex in cell_outputs) {
+        var output = cell_outputs[outputindex];
+        if (output.output_type == 'display_data') {
+          cell.output_area.outputs.splice(outputindex, 1);
+          return;
+        }
+      }
+    } else {
+      // Not running under IPython; use a different approach and just clear the DOM.
+      // Iterate through the IPython outputs...
+      var outputDivs = document.getElementsByClassName('output_wrapper');
+      if (outputDivs) {
+        for (var i = 0; i < outputDivs.length; i++) {
+          // ...and any chart outputs in each...
+          var chartDivs = outputDivs[i].getElementsByClassName('bqgc');
+          if (chartDivs) {
+            for (var j = 0; j < chartDivs.length; j++) {
+              // ...until we find the chart div ID we want...
+              if (chartDivs[j].id == model.dom.id) {
+                // ...then get any PNG outputs in that same output group...
+                var pngDivs = outputDivs[i].getElementsByClassName('output_png');
+                if (pngDivs) {
+                  for (var k = 0; k < pngDivs.length; k++) {
+                    // ... and clear their contents.
+                    pngDivs[k].innerHTML = '';
+                  }
+                }
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  function addStaticChart(model, chart) {
+    var cell;
+    if (chart.getImageURI == undefined || (cell = getCell(model)) == undefined) {
+      return;
+    }
+    var static_chart = chart.getImageURI();
+    var img = static_chart.substr(static_chart.indexOf(',') + 1);  // strip leading base64 etc.
+    var static_output = {
+      metadata: {},
+      data: {
+        'image/png': img
+      },
+      output_type: 'display_data'
+    };
+    cell.output_area.outputs.push(static_output);
+  }
+
   // The main render method, called from Python-generated code. dom is the DOM element
   // for the chart, model is a set of parameters from Python, and options is a JSON
   // set of options provided by the user in the cell magic body, which takes precedence over
   // model. An initial set of data can be passed in as a final optional parameter.
-  function render(dom, model, options, data) {
+  function render(dom, model, options, data, controlIds) {
     if (model.chartStyle == 'paged_table' && document._in_nbconverted) {
        model.chartStyle = 'table';
        var p = document.createElement("div");
        p.innerHTML = '<br>(Truncated to first page of results)';
        dom.parentNode.insertBefore(p, dom.nextSibling);
     }
+
+    model.hasIPython = false;
+    try {
+      if (IPython) {
+        model.hasIPython = true;
+      }
+    } catch(e) {
+    }
+
     var chartInfo = chartMap[model.chartStyle];
     var chartScript = chartInfo.script || 'corechart';
     dom.innerHTML = '';
@@ -215,10 +379,65 @@ define("extensions/charting", function () {
       data = convertListToDataTable(data);
     }
     convertDates(data);
+    model.dom = dom;
+    removeStaticChart(model);  // Remove any existing chart PNG.
+
+    if (controlIds) {
+      var controlHandler = function() {
+        if (model.chartStyle == 'paged_table') {
+          model.totalRows = -1;
+          model.dataOffset = 0;
+          model.firstRow = 0;
+          model.data = undefined;
+          getPagedData(model, 0);
+        } else {
+          refresh(model, 0, -1, 0);
+        }
+      }
+      for (var i = 0; i < controlIds.length; i++) {
+        var id = controlIds[i];
+        var split = id.indexOf(':');
+        if (split >= 0) {
+          // Checkbox group.
+          var count = parseInt(id.substring(split + 1));
+          var base = id.substring(0, split + 1);
+          for (var j = 0; j < count; j++) {
+            var control = document.getElementById(base + j);
+            control.disabled = !model.hasIPython;
+            control.addEventListener('change', controlHandler);
+          }
+          continue;
+        }
+        // See if we have an associated control that needs dual binding.
+        var control = document.getElementById(id);
+        control.disabled = !model.hasIPython;
+        var textControl = document.getElementById(id + '_value');
+        if (textControl) {
+          textControl.disabled = !model.hasIPython;
+          textControl.addEventListener('change', function() {
+            if (control.value != textControl.value) {
+              control.value = textControl.value;
+              controlHandler();
+            }
+          });
+          control.addEventListener('change', function() {
+              textControl.value = control.value;
+              controlHandler();
+          });
+        } else {
+          control.addEventListener('change', controlHandler);
+        }
+      }
+    }
 
     require(['visualization!' + chartScript], function (visualization) {
       var chartType = visualization[chartInfo.name];
       var chart = new chartType(dom);
+
+      // Generate and add a new static chart once chart is ready.
+      google.visualization.events.addListener(chart, 'ready', function () {
+        addStaticChart(model, chart);
+      });
 
       options = options || {};
       if ((model.chartStyle == 'paged_table') || (model.chartStyle == 'table')) {
@@ -235,29 +454,31 @@ define("extensions/charting", function () {
         };
       }
 
-      if (model.chartStyle != 'paged_table') {
-        chart.draw(new visualization.DataTable(data), options);
-      }
-      else {
-        if (options.pageSize == undefined) {
-          options.pageSize = model.rowsPerPage || 25;
+      model.fetchCode = '%_get_chart_data ' + model.dataName + ' ' + (model.fields || '*');
+      model.controlIds = controlIds;
+      model.options = options;
+      model.data = data;
+      model.chart = chart;
+      model.dom = dom;
+      model.cache = {};
+      model.visualization = visualization;
+
+      if (model.chartStyle == 'paged_table') {
+        if (model.options.pageSize == undefined) {
+          model.options.pageSize = model.rowsPerPage || 25;
         }
-        model.dom = dom;
-        model.chart = chart;
-        model.visualization = visualization;
-        model.fetchCode = '%_get_chart_data ' + model.dataName + ' ' + (model.fields || '*');
-        model.options = options;
         model.totalRows = model.totalRows || -1; // Total rows in all (server-side) data.
         model.dataOffset = 0; // Where the cached data[] array starts from.
         model.firstRow = 0;  // Index of first row being displayed in page.
-
-        model.data = data;
-
         visualization.events.addListener(chart, 'page', function(e) {
           handlePageEvent(model, e.page);
         });
-
         getPagedData(model, 0);
+      } else {
+        var env = getControlEnvironment(model);
+        var key = env + '0/-1';  // startRow and fetchCount for non-paged data.
+        model.cache[key] = {'data': model.data};
+        model.chart.draw(new model.visualization.DataTable(model.data), model.options);
       }
     });
   }

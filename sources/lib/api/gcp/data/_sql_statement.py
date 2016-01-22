@@ -79,7 +79,7 @@ class SqlStatement(object):
     """
 
     # Get the set of $var references in this SQL.
-    dependencies = SqlStatement.get_dependencies(sql)
+    dependencies = SqlStatement._get_dependencies(sql)
     for dependency in dependencies:
       # Now we check each dependency. If it is in complete - i.e., we have an expansion
       # for it already - we just continue.
@@ -112,6 +112,10 @@ class SqlStatement(object):
         resolved_vars[dependency] = dep
 
   @staticmethod
+  def _escape_string(s):
+    return '"' + s.replace('"', '\\"') + '"'
+
+  @staticmethod
   def format(sql, args=None, udfs=None):
     """ Resolve variable references in a query within an environment.
 
@@ -138,7 +142,7 @@ class SqlStatement(object):
     # variable references substituted with their values, or literal text copied
     # over as-is.
     parts = []
-    for (escape, placeholder, literal) in SqlStatement._get_tokens(sql):
+    for (escape, placeholder, _, literal) in SqlStatement._get_tokens(sql):
       if escape:
         parts.append('$')
       elif placeholder:
@@ -146,8 +150,7 @@ class SqlStatement(object):
         try:
           value = resolved_vars[variable]
         except KeyError as e:
-          raise Exception('Invalid sql. Unable to substitute $%s.' % e.args[0],
-                          e.args[0])
+          raise Exception('Invalid sql. Unable to substitute $%s.' % e.args[0])
 
         if isinstance(value, types.ModuleType):
           value = _sql_module.SqlModule.get_default_query_from_module(value)
@@ -158,8 +161,21 @@ class SqlStatement(object):
         elif '_repr_sql_' in dir(value):
           # pylint: disable=protected-access
           value = value._repr_sql_()
-        elif (type(value) == str) or (type(value) == unicode):
-          value = '"' + value.replace('"', '\\"') + '"'
+        elif type(value) == str or type(value) == unicode:
+          value = SqlStatement._escape_string(value)
+        elif isinstance(value, list) or isinstance(value, tuple):
+          if isinstance(value, tuple):
+            value = list(value)
+          expansion = '('
+          for v in value:
+            if len(expansion) > 1:
+              expansion += ', '
+            if type(v) == str or type(v) == unicode:
+              expansion += SqlStatement._escape_string(v)
+            else:
+              expansion += str(v)
+          expansion += ')'
+          value = expansion
         else:
           value = str(value)
         parts.append(value)
@@ -171,19 +187,21 @@ class SqlStatement(object):
 
   @staticmethod
   def _get_tokens(sql):
-    # Find escaped '$' characters ($$), or "$<name>" variable references, or
+    # Find escaped '$' characters ($$), "$<name>" variable references, lone '$' characters, or
     # literal sequences of character without any '$' in them (in that order).
-    return re.findall(r'(\$\$)|(\$[a-zA-Z0-9_\.]+)|([^\$]*)', sql)
+    return re.findall(r'(\$\$)|(\$[a-zA-Z_][a-zA-Z0-9_\.]*)|(\$)|([^\$]*)', sql)
 
   @staticmethod
-  def get_dependencies(sql):
+  def _get_dependencies(sql):
     """ Return the list of variables referenced in this SQL. """
     dependencies = []
-    for (_, placeholder, _) in SqlStatement._get_tokens(sql):
+    for (_, placeholder, dollar, _) in SqlStatement._get_tokens(sql):
       if placeholder:
         variable = placeholder[1:]
         if variable not in dependencies:
           dependencies.append(variable)
+      elif dollar:
+        raise Exception('Invalid sql; $ with no following $ or identifier: %s.' % sql)
     return dependencies
 
 import _sql_module

@@ -54,6 +54,15 @@ class TestCases(unittest.TestCase):
     # Mock API for getting item metadata.
     mock_api_objects_get.side_effect = self._mock_api_objects_get()
 
+    items = gcp.datalab._storage._expand_list(None)
+    self.assertEqual([], items)
+
+    items = gcp.datalab._storage._expand_list([])
+    self.assertEqual([], items)
+
+    items = gcp.datalab._storage._expand_list('gs://bar/o*')
+    self.assertEqual(['gs://bar/object1', 'gs://bar/object3'], items)
+
     items = gcp.datalab._storage._expand_list(['gs://foo', 'gs://bar'])
     self.assertEqual(['gs://foo', 'gs://bar'], items)
 
@@ -103,7 +112,8 @@ class TestCases(unittest.TestCase):
         'source': ['gs://foo/item*'],
         'destination': 'gs://foo/bar1'
       }, None)
-    self.assertEqual('Invalid target object gs://foo/bar1', error.exception.message)
+    self.assertEqual('More than one source but target gs://foo/bar1 is not a bucket',
+                     error.exception.message)
 
   @mock.patch('gcp.datalab._storage._storage_copy', autospec=True)
   def test_storage_copy_magic(self, mock_storage_copy):

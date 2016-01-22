@@ -322,7 +322,15 @@ function initializeNotebookApplication(ipy, notebook, events, dialog, utils) {
         }
         else {
           this.element.addClass('completed');
-          this.element.find('div.status').remove();
+          var status = this.element.find('div.status');
+          if (status) {
+            status.remove();
+          }
+        }
+      } else {
+        var status = this.element.find('div.status');
+        if (status) {
+          status.remove();
         }
       }
     }
@@ -830,7 +838,7 @@ function initializeNotebookList(ipy, notebookList, newNotebook, events, dialog, 
     if (version >= versionInfo.latest) {
       return;
     }
-    var instance = document.body.getAttribute('data-instance-id');
+    var instance = document.body.getAttribute('data-instance-name');
     var deployerLink = 'https://datalab.cloud.google.com?name=' + instance;
     var optional = (version >= versionInfo.last);
     var messageDiv = document.getElementById('updateMessageArea');
